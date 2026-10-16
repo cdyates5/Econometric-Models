@@ -1,0 +1,7 @@
+# raw downloads (restored from the Actions cache in CI)
+.grid_cache/
+# built page (deployed as a Pages artifact, not committed)
+site/
+__pycache__/
+*.pyc
+.venv/
