@@ -1,0 +1,138 @@
+name: Refresh US GRID dashboard
+
+on:
+  schedule:
+    # Weekdays, times in UTC. US releases land at 08:30 or 10:00 New York time and reach FRED within about an hour.
+    #   16:17 UTC = 11:17 EST / 12:17 EDT   (Melbourne 03:17 AEDT / 02:17 AEST next day)
+    #   22:47 UTC = 17:47 EST / 18:47 EDT   (Melbourne 09:47 AEDT / 08:47 AEST next day) - catches late FRED postings
+    - cron: '17 16 * * 1-5'
+    - cron: '47 22 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Publish and archive even if the data have not changed'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: grid-refresh
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: write          # commit the forecast archive
+    outputs:
+      changed: ${{ steps.build.outputs.changed }}
+      deploy: ${{ steps.plan.outputs.deploy }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore download cache
+        uses: actions/cache@v6
+        with:
+          path: .grid_cache
+          key: grid-cache-${{ github.run_id }}
+          restore-keys: grid-cache-
+
+      - name: Rebuild dashboard
+        id: build
+        env:
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+          BLS_API_KEY: ${{ secrets.BLS_API_KEY }}
+          REF42_JSON: ${{ secrets.REF42_JSON }}
+          GRID_PUBLIC: ${{ vars.GRID_PUBLIC }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          if [ -z "${FRED_API_KEY}" ]; then
+            echo "::error::Repository secret FRED_API_KEY is not set (Settings > Secrets and variables > Actions)."
+            exit 1
+          fi
+          ARGS=(--out site/index.html --cache-dir .grid_cache --fingerprint archive/fingerprint.txt --archive-dir archive)
+          if [ "${GRID_PUBLIC:-}" = "true" ] || { [ ! -f ref/ref42.json ] && [ -z "${REF42_JSON:-}" ]; }; then
+            ARGS+=(--public)
+            echo "::notice::Public build: no 42 Macro or Bloomberg data on the page."
+          fi
+          if [ "${FORCE:-false}" = "true" ]; then ARGS+=(--force); fi
+          python rebuild.py "${ARGS[@]}"
+
+      - name: Decide whether to deploy
+        id: plan
+        env:
+          CHANGED: ${{ steps.build.outputs.changed }}
+          EVENT: ${{ github.event_name }}
+          GRID_PAGES: ${{ vars.GRID_PAGES }}
+        run: |
+          deploy=false
+          if [ "${GRID_PAGES:-true}" != "false" ] && { [ "${CHANGED}" = "true" ] || [ "${EVENT}" = "workflow_dispatch" ]; }; then
+            deploy=true
+          fi
+          echo "deploy=${deploy}" >> "$GITHUB_OUTPUT"
+          echo "Changed: ${CHANGED} | deploy to Pages: ${deploy}"
+
+      - name: Keep a downloadable copy of the page
+        uses: actions/upload-artifact@v7
+        with:
+          name: us-grid-dashboard
+          path: site/index.html
+          retention-days: 30
+
+      - name: Package site for Pages
+        if: steps.plan.outputs.deploy == 'true'
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+
+      - name: Commit forecast archive
+        if: steps.build.outputs.changed == 'true'
+        env:
+          ASOF: ${{ steps.build.outputs.asof }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add archive
+          if git diff --cached --quiet; then
+            echo "Archive unchanged."
+            exit 0
+          fi
+          git commit -m "Forecast snapshot: ${ASOF}"
+          for attempt in 1 2 3; do
+            if git push; then exit 0; fi
+            echo "Push rejected (attempt ${attempt}); rebasing and retrying."
+            git pull --rebase
+          done
+          echo "::error::Could not push the forecast archive."
+          exit 1
+
+  deploy:
+    needs: build
+    if: needs.build.outputs.deploy == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5
